@@ -52,7 +52,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"     # ESP32 pio toolchains reject Python >= 3.14
-          cache: "pip"
 
       - name: Install PlatformIO + esptool
         if: matrix.build == 'platformio'
