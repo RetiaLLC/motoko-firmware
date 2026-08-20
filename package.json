@@ -1,0 +1,7 @@
+{
+  "name": "motoko-firmware",
+  "version": "4.0.0",
+  "description": "Motoko 802.11 radio-pipe firmware for Retia hardware — one repo, all supported boards, released into the scriptkitty.sh channel (gated until hardware-verified).",
+  "private": true,
+  "license": "MIT"
+}

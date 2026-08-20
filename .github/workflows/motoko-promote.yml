@@ -1,0 +1,91 @@
+# Motoko promote: mark a release VERIFIED after hardware verification.
+#
+# scriptkitty release-channel contract: prerelease = untested auto-build,
+# full release = verified on real hardware. This workflow:
+#   1. attaches verification-<device>.json evidence to the release
+#   2. flips prerelease -> full release
+#   3. pings the scriptkitty.sh flasher so the new default goes live
+#
+# Run it AFTER you (or the workbench) actually flashed the bin and confirmed it
+# boots + captures. Never promote a build you didn't test.
+#
+#   gh workflow run motoko-promote.yml -f tag=motoko-v4.0.0-sk.1 \
+#      -f device=newsheen -f method=human -f notes="boot + on-air capture OK"
+name: Motoko Promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to promote (e.g. motoko-v4.0.0-sk.1)"
+        type: string
+        required: true
+      device:
+        description: "Which board build was verified"
+        type: choice
+        options: [newsheen, wifi-nugget, all]
+        required: true
+      method:
+        description: "How it was verified"
+        type: choice
+        options: [human, workbench]
+        required: true
+      notes:
+        description: "What was checked (boot, capture, TX…)"
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Attach verification evidence + flip to full release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          DEVICE: ${{ inputs.device }}
+          METHOD: ${{ inputs.method }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName \
+            || { echo "::error::release $TAG not found"; exit 1; }
+
+          if [ "$DEVICE" = "all" ]; then DEVICES="newsheen wifi-nugget"; else DEVICES="$DEVICE"; fi
+          for d in $DEVICES; do
+            python3 - "$d" <<'PY'
+          import json, os, sys, datetime
+          d = sys.argv[1]
+          json.dump({
+              "target": d,
+              "method": os.environ["METHOD"],
+              "date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d"),
+              "verified_by": os.environ.get("GITHUB_ACTOR", ""),
+              "notes": os.environ.get("NOTES", ""),
+              "workflow_run": f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+          }, open(f"verification-{d}.json", "w"), indent=2)
+          PY
+            gh release upload "$TAG" "verification-$d.json" --repo "$GITHUB_REPOSITORY" --clobber
+            echo "attached verification-$d.json ($METHOD)"
+          done
+
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --prerelease=false
+          echo "$TAG promoted to VERIFIED"
+
+      - name: Ping scriptkitty.sh flasher
+        env:
+          SK_TOKEN: ${{ secrets.SCRIPTKITTY_DISPATCH_TOKEN }}
+        run: |
+          if [ -n "$SK_TOKEN" ]; then
+            curl -sf -X POST \
+              -H "Authorization: Bearer $SK_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/RetiaLLC/scriptkitty.sh/dispatches \
+              -d '{"event_type":"channel-release"}' \
+              && echo "flasher rebuild triggered" \
+              || echo "::warning::dispatch to scriptkitty.sh failed — site picks this up on its weekly cron"
+          else
+            echo "::notice::SCRIPTKITTY_DISPATCH_TOKEN not set — site picks this up on its weekly cron or a manual run"
+          fi

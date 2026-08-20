@@ -1,0 +1,8 @@
+# PlatformIO build output
+firmware/**/.pio/
+firmware/**/dist/
+# host test build artifacts
+firmware/newsheen/host/fw_logic_test
+firmware/newsheen/host/*.bin
+firmware/newsheen/host/*.o
+.DS_Store

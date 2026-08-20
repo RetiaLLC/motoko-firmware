@@ -1,0 +1,166 @@
+# Motoko automatic release build.
+#
+# Builds/collects every supported board and publishes a PRERELEASE — in the
+# scriptkitty release-channel contract a prerelease means "automatically compiled,
+# NOT yet verified on hardware". scriptkitty.sh offers these behind an "untested"
+# warning. After a human or the workbench verifies a build, run "Motoko Promote"
+# to flip it to a full release (= verified), which makes it the flasher default.
+#
+# Tagging: motoko-v<version>-sk.<n>  (<version> from package.json, <n> auto-increments).
+# Assets: motoko-<device>.factory.bin (esp32) / motoko-<device>.bin (esp8266) — these
+# names are a CONTRACT (the scriptkitty channel matches releases by asset name).
+name: Motoko Release Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      notes:
+        description: "Extra release notes (what changed / why this build)"
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: motoko-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - device: newsheen
+            build: platformio
+            project_dir: firmware/newsheen
+            env: newsheen-motoko
+            chip: esp32s3
+            flash: 16MB
+            asset: motoko-newsheen.factory.bin
+          - device: wifi-nugget
+            build: prebuilt
+            prebuilt: firmware/wifi-nugget/prebuilt/motoko-wifi-nugget.bin
+            asset: motoko-wifi-nugget.bin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        if: matrix.build == 'platformio'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"     # ESP32 pio toolchains reject Python >= 3.14
+          cache: "pip"
+
+      - name: Install PlatformIO + esptool
+        if: matrix.build == 'platformio'
+        run: pip install platformio esptool
+
+      - name: Cache PlatformIO
+        if: matrix.build == 'platformio'
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio/.cache
+          key: pio-${{ runner.os }}-${{ matrix.env }}-${{ hashFiles(format('{0}/platformio.ini', matrix.project_dir)) }}
+
+      - name: Build firmware (${{ matrix.env }})
+        if: matrix.build == 'platformio'
+        run: pio run -e ${{ matrix.env }}
+        working-directory: ${{ matrix.project_dir }}
+
+      - name: Merge factory image (DIO — QIO bricks ESP32-S3)
+        if: matrix.build == 'platformio'
+        run: |
+          B="${{ matrix.project_dir }}/.pio/build/${{ matrix.env }}"
+          BOOT_APP0=$(find ~/.platformio/packages -path '*framework-arduinoespressif32*/tools/partitions/boot_app0.bin' | head -1)
+          test -n "$BOOT_APP0" || { echo "::error::boot_app0.bin not found"; exit 1; }
+          esptool --chip ${{ matrix.chip }} merge-bin \
+            -o ${{ matrix.asset }} \
+            --flash-mode dio --flash-freq 80m --flash-size ${{ matrix.flash }} \
+            0x0 "$B/bootloader.bin" \
+            0x8000 "$B/partitions.bin" \
+            0xE000 "$BOOT_APP0" \
+            0x10000 "$B/firmware.bin"
+          HDR=$(xxd -p -l 4 ${{ matrix.asset }})
+          echo "header: $HDR"
+          [ "${HDR:4:2}" = "02" ] || { echo "::error::flash-mode byte is not DIO"; exit 1; }
+          # 16MB flash-size nibble must be 4 (else esptool-js flashes verbatim and boot-loops)
+          [ "${HDR:6:1}" = "4" ] || echo "::warning::flash-size header nibble != 4 (expected for 16MB)"
+          sha256sum ${{ matrix.asset }}
+
+      - name: Package prebuilt image
+        if: matrix.build == 'prebuilt'
+        run: |
+          test -f "${{ matrix.prebuilt }}" || { echo "::error::prebuilt ${{ matrix.prebuilt }} missing"; exit 1; }
+          cp "${{ matrix.prebuilt }}" "${{ matrix.asset }}"
+          sha256sum ${{ matrix.asset }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: motoko-${{ matrix.device }}
+          path: ${{ matrix.asset }}
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need all tags to pick the next -sk.<n>
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: motoko-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create prerelease (auto build — untested)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXTRA_NOTES: ${{ inputs.notes }}
+        run: |
+          VERSION=$(python3 -c "import json; print(json.load(open('package.json'))['version'])")
+          N=1
+          while git rev-parse -q --verify "refs/tags/motoko-v${VERSION}-sk.${N}" >/dev/null; do
+            N=$((N + 1))
+          done
+          TAG="motoko-v${VERSION}-sk.${N}"
+          {
+            echo "**Automatic build — UNTESTED.** Compiled from \`${GITHUB_SHA}\` by CI;"
+            echo "nobody has verified this on hardware yet. It appears on"
+            echo "[scriptkitty.sh](https://scriptkitty.sh) under \"untested auto-builds\"."
+            echo
+            echo "After hardware verification, run the **Motoko Promote** workflow"
+            echo "with this tag to mark it verified and make it the flasher default."
+            echo
+            echo "| asset | sha256 |"
+            echo "|---|---|"
+            for f in dist/*; do
+              echo "| $(basename "$f") | $(sha256sum "$f" | cut -d' ' -f1) |"
+            done
+            if [ -n "$EXTRA_NOTES" ]; then echo; echo "$EXTRA_NOTES"; fi
+          } > notes.md
+          gh release create "$TAG" --prerelease \
+            --title "Motoko ${VERSION} auto build sk.${N}" \
+            --notes-file notes.md \
+            dist/*
+          echo "published $TAG"
+
+      - name: Ping scriptkitty.sh flasher
+        env:
+          SK_TOKEN: ${{ secrets.SCRIPTKITTY_DISPATCH_TOKEN }}
+        run: |
+          if [ -n "$SK_TOKEN" ]; then
+            curl -sf -X POST \
+              -H "Authorization: Bearer $SK_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/RetiaLLC/scriptkitty.sh/dispatches \
+              -d '{"event_type":"channel-release"}' \
+              && echo "flasher rebuild triggered" \
+              || echo "::warning::dispatch to scriptkitty.sh failed — site picks this up on its weekly cron"
+          else
+            echo "::notice::SCRIPTKITTY_DISPATCH_TOKEN not set — site picks this up on its weekly cron or a manual run"
+          fi

@@ -1,0 +1,141 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Motoko-S3 · HID display</title>
+<style>
+  :root{--bg:#0b0f14;--fg:#d7e0ea;--dim:#7b8794;--line:#1d2733;--acc:#57d0a8;--warn:#ff5d73;--card:#111823}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 ui-monospace,Menlo,Consolas,monospace}
+  header{padding:14px 16px;border-bottom:1px solid var(--line);display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+  h1{font-size:15px;margin:0;letter-spacing:.5px}
+  .sub{color:var(--dim);font-size:12px}
+  button{background:#16202c;color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:8px 12px;cursor:pointer}
+  button:hover{border-color:var(--acc)}
+  .pill{margin-left:auto;color:var(--dim)}
+  .wrap{display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:12px}
+  @media(max-width:760px){.wrap{grid-template-columns:1fr}}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px;min-height:120px}
+  .card h2{font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:1px;margin:0 0 8px}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  td,th{text-align:left;padding:3px 6px;border-bottom:1px solid var(--line);white-space:nowrap}
+  th{color:var(--dim);font-weight:400}
+  .kpi{display:flex;gap:18px;flex-wrap:wrap}
+  .kpi div{font-size:12px;color:var(--dim)}
+  .kpi b{display:block;font-size:22px;color:var(--fg)}
+  .kpi b.warn{color:var(--warn)}
+  #log{height:220px;overflow:auto;font-size:11.5px;color:var(--dim)}
+  .ev{color:var(--fg)} .eb{color:#8fd0ff} .ed{color:#c9a6ff} .ee{color:var(--warn)}
+  .ctl{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  input[type=number]{width:64px;background:#0c141d;border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:5px}
+  .note{color:var(--dim);font-size:12px;padding:0 16px 14px}
+</style>
+
+<header>
+  <h1>MOTOKO&#8209;S3 · <span style="color:var(--acc)">HID display</span></h1>
+  <span class="sub">reads the capture stream over <b>WebHID</b> — works on Android/mobile, where Web&nbsp;Serial does not</span>
+  <span class="pill" id="status">disconnected</span>
+</header>
+
+<div style="padding:12px 16px 0"><button id="connect">Connect puck (HID)</button></div>
+
+<div class="wrap">
+  <div class="card">
+    <h2>Live counters</h2>
+    <div class="kpi">
+      <div>Frames<b id="k_frames">0</b></div>
+      <div>APs<b id="k_aps">0</b></div>
+      <div>Clients<b id="k_clients">0</b></div>
+      <div>Deauth<b id="k_deauth">0</b></div>
+      <div>EAPOL<b id="k_eapol">0</b></div>
+      <div>PMKID<b id="k_pmkid" class="warn">0</b></div>
+    </div>
+    <div class="ctl" style="margin-top:12px">
+      <span class="sub">channel</span><input type="number" id="ch" min="1" max="14" value="6">
+      <button id="setch">set (0x01)</button>
+      <button id="hunt">hunt handshake (0x07)</button>
+    </div>
+    <div class="note" style="padding:8px 0 0">Commands ride HID OUT reports → identical SLIP the CDC path uses.</div>
+  </div>
+
+  <div class="card">
+    <h2>Access points</h2>
+    <table><thead><tr><th>BSSID</th><th>SSID</th><th>sec</th><th>ch</th><th>rssi</th></tr></thead>
+    <tbody id="aps"></tbody></table>
+  </div>
+
+  <div class="card" style="grid-column:1/-1">
+    <h2>Event stream</h2>
+    <div id="log"></div>
+  </div>
+</div>
+<div class="note">Motoko-S3 firmware <code>newsheen-motoko-hid</code> presents a composite CDC + vendor&nbsp;HID (usage&nbsp;page 0xFF00). Reports are 64&nbsp;bytes of SLIP, padded with 0xC0. TYPE_PKT_RECV(0x03) and TYPE_EAPOL(0x06) frames carry a 12&#8209;byte metadata prefix + the full 802.11 frame.</div>
+
+<script>
+// ---- SLIP decoder (RFC1055) — same framing as slip.js ----
+const END=0xc0,ESC=0xdb,ESC_END=0xdc,ESC_ESC=0xdd;
+class Slip{constructor(cb){this.cb=cb;this.buf=new Uint8Array(4096);this.p=0;this.esc=false}
+  push(b){for(const x of b){if(x===END){if(this.p>0){this.cb(this.buf.slice(0,this.p));this.p=0}}
+    else if(x===ESC){this.esc=true}else if(this.esc){this.buf[this.p++]=(x===ESC_END)?END:(x===ESC_ESC)?ESC:x;this.esc=false}
+    else{this.buf[this.p++]=x} if(this.p>=this.buf.length)this.p=0}}}
+
+// ---- 802.11 parse — mirrors parser.js; adds EAPOL(0x06) handling ----
+function mac(f,o){return o+6>f.length?null:[...f.slice(o,o+6)].map(b=>b.toString(16).padStart(2,'0')).join(':')}
+function ssidOf(f,fx){let p=24+fx;while(p+2<=f.length){const id=f[p],ln=f[p+1];if(id===0){const s=new TextDecoder().decode(f.slice(p+2,p+2+ln)).replace(/[^\x20-\x7e]/g,'').trim();return s||'<hidden>'}p+=2+ln}return '<hidden>'}
+function secOf(f,fx){let p=24+fx,sec='OPEN';while(p+2<=f.length){const id=f[p],ln=f[p+1];if(id===48)return 'WPA2';if(id===221&&ln>=4){const o=f.slice(p+2,p+6);if(o[0]===0&&o[1]===0x50&&o[2]===0xf2&&o[3]===1)sec='WPA'}p+=2+ln}return sec}
+function parse(raw){
+  const t=raw[0]; if(t!==0x03&&t!==0x06)return null;
+  const rssi=raw[1]>127?raw[1]-256:raw[1], ch=raw[11]&0x0f, f=raw.slice(13);
+  if(f.length<24)return null;
+  const st=(f[0]&0xf0)>>4, ty=(f[0]&0x0c)>>2;
+  if(t===0x06)return{type:'eapol',mac:mac(f,10),rssi,ch};   // S3-only handshake frame
+  if(ty===0){ if(st===8||st===5){return{type:'beacon',ssid:ssidOf(f,12),mac:mac(f,16),rssi,ch,sec:secOf(f,12)}}
+    if(st===4)return{type:'probe',ssid:ssidOf(f,0),mac:mac(f,10),rssi};
+    if(st===10||st===12)return{type:'deauth',mac:mac(f,16)||mac(f,10),rssi}; }
+  if(ty===2)return{type:'data',mac:mac(f,10),rssi};
+  return null;
+}
+
+// ---- state / UI ----
+const S={frames:0,aps:new Map(),clients:new Set(),deauth:0,eapol:0,pmkid:0};
+const $=id=>document.getElementById(id);
+function kpi(){$('k_frames').textContent=S.frames;$('k_aps').textContent=S.aps.size;$('k_clients').textContent=S.clients.size;
+  $('k_deauth').textContent=S.deauth;$('k_eapol').textContent=S.eapol;$('k_pmkid').textContent=S.pmkid}
+function drawAps(){const b=$('aps');b.innerHTML='';[...S.aps.values()].slice(-40).forEach(a=>{
+  b.insertAdjacentHTML('beforeend',`<tr><td>${a.mac}</td><td>${a.ssid}</td><td>${a.sec}</td><td>${a.ch}</td><td>${a.rssi}</td></tr>`)})}
+function log(cls,msg){const l=$('log');const d=document.createElement('div');d.className=cls;d.textContent=msg;l.appendChild(d);
+  while(l.children.length>200)l.removeChild(l.firstChild);l.scrollTop=l.scrollHeight}
+
+function onFrame(raw){
+  // pkt may carry a PMKID flag if firmware set TYPE_EAPOL; we also detect from the raw M1 KDE
+  const p=parse(raw); if(!p)return; S.frames++;
+  if(p.type==='beacon'){S.aps.set(p.mac,p);drawAps();log('eb',`beacon ${p.ssid} [${p.sec}] ${p.mac} ${p.rssi}dBm ch${p.ch}`)}
+  else if(p.type==='probe'){S.clients.add(p.mac);log('ev',`probe  ${p.ssid} <- ${p.mac}`)}
+  else if(p.type==='data'){S.clients.add(p.mac);log('ed',`data   ${p.mac}`)}
+  else if(p.type==='deauth'){S.deauth++;log('ee',`DEAUTH ${p.mac}`)}
+  else if(p.type==='eapol'){S.eapol++; const pm=hasPmkid(raw.slice(13)); if(pm)S.pmkid++;
+    log('ee',`EAPOL-KEY ${p.mac} ${pm?'★ PMKID CAPTURED (clientless-crackable)':''}`)}
+  kpi();
+}
+// PMKID KDE presence in an M1 key-data (DD .. 00 0F AC 04)
+function hasPmkid(f){for(let i=0;i+6<=f.length;i++){if(f[i]===0xdd&&f[i+2]===0x00&&f[i+3]===0x0f&&f[i+4]===0xac&&f[i+5]===0x04)return true}return false}
+
+// ---- WebHID transport ----
+let device=null, slip=new Slip(onFrame);
+async function connect(){
+  if(!('hid' in navigator)){$('status').textContent='WebHID unavailable (use Chrome/Edge, incl. Android)';return}
+  const filters=[{vendorId:0x303a}];
+  const [d]=await navigator.hid.requestDevice({filters}).then(a=>a).catch(()=>[]);
+  if(!d){$('status').textContent='no device selected';return}
+  device=d; if(!d.opened)await d.open();
+  $('status').textContent='linked: '+d.productName;
+  d.addEventListener('inputreport',e=>{ slip.push(new Uint8Array(e.data.buffer)); });
+}
+function slipEncode(type,payload){ // build one host->device SLIP frame
+  const out=[END,type];for(const b of payload){if(b===END){out.push(ESC,ESC_END)}else if(b===ESC){out.push(ESC,ESC_ESC)}else out.push(b)}out.push(END);return out}
+async function sendCmd(type,payload){ if(!device)return;
+  const s=slipEncode(type,payload); const rep=new Uint8Array(64).fill(END);
+  rep.set(s.slice(0,64)); await device.sendReport(0,rep); }
+$('connect').onclick=connect;
+$('setch').onclick=()=>sendCmd(0x01,[parseInt($('ch').value)||6]);
+$('hunt').onclick=()=>sendCmd(0x07,[parseInt($('ch').value)||6, 0,0,0,0,0,0]); // ch + broadcast bssid
+</script>

@@ -1,0 +1,41 @@
+# Supported boards for the Motoko firmware family.
+#
+# One repo, all boards. The release workflow (.github/workflows/motoko-release.yml)
+# builds/collects each board and publishes ONE GitHub release carrying every board's
+# asset. scriptkitty.sh has one `binary_source: channel` card per board, all pointing
+# at THIS repo with a different `asset_pattern` — so a release here flows automatically
+# onto the flasher, gated until a `verification-<device>.json` marks it verified.
+#
+# Asset names are a CONTRACT: they must stay identical across every release (the
+# channel matches releases by asset name — renaming silently drops history).
+
+boards:
+  - device: newsheen                 # ESP32-S3 Pusheen/Newsheen puck (esp32_base_puck_v2, N16R2)
+    display: "Newsheen Puck"
+    mcu: esp32-s3
+    build: platformio
+    project_dir: firmware/newsheen
+    env: newsheen-motoko             # the CDC build (see firmware/newsheen/platformio.ini)
+    chip: esp32s3
+    flash: 16MB
+    asset: motoko-newsheen.factory.bin
+    verification: verification-newsheen.json
+    scriptkitty_id: newsheen-motoko
+
+  - device: wifi-nugget              # ESP8266 WiFi Nugget (D1-mini class)
+    display: "WiFi Nugget"
+    mcu: esp8266
+    # The shipped bin is built against a PATCHED esp8266 SDK so wifi_send_pkt_freedom()
+    # radiates deauth (stock cores return -1 and radiate nothing). That toolchain isn't
+    # reproducible in stock CI yet, so this board ships its verified prebuilt bin; the
+    # source (firmware/wifi-nugget/bridge/bridge.ino) is here for transparency + a future
+    # patched-SDK CI build.
+    build: prebuilt
+    prebuilt: firmware/wifi-nugget/prebuilt/motoko-wifi-nugget.bin
+    asset: motoko-wifi-nugget.bin
+    verification: verification-wifi-nugget.json
+    scriptkitty_id: wifi-nugget-motoko-bpi
+
+# Adding a board = add an entry here + a matrix row in motoko-release.yml + a
+# `binary_source: channel` profile in RetiaLLC/scriptkitty.sh (asset_pattern = this asset).
+# Candidates: Bluetooth Nugget / DEF CON badge (ESP32-S3, same esp_wifi_80211_tx path as newsheen).
